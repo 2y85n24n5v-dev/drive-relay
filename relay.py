@@ -55,8 +55,8 @@ TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # --------------------------------------------------------------------------- 基础
 
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
+def log(msg: str, err: bool = False) -> None:
+    print(msg, file=sys.stderr if err else sys.stdout, flush=True)
 
 
 def human(n: float) -> str:
@@ -409,18 +409,30 @@ def relay_gh(args: argparse.Namespace, plan: list[tuple[str, str]]) -> int:
     src.mkdir()
 
     sizes: dict[str, int] = {}
+    failed: list[tuple[str, str]] = []
     for idx, (fid, rel) in enumerate(plan, 1):
         free = check_free(src)
         log(f"[{idx}/{len(plan)}] 下载 {rel}（磁盘余 {human(free)}）")
         try:
             size = download_one(fid, rel, src, args.timeout, args.retries)
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"下载失败: {rel}\n{exc}") from exc
+            if args.fail_fast:
+                raise RuntimeError(f"下载失败: {rel}\n{exc}") from exc
+            # 单个文件没权限/被删除时，不让整批任务白跑。
+            print(f"[跳过] {rel}: {exc}", file=sys.stderr, flush=True)
+            failed.append((rel, str(exc)))
+            continue
         sizes[rel] = size
         log(f"    完成 {human(size)}")
 
+    if not sizes:
+        raise RuntimeError(
+            "所有文件都下载失败（常见原因：链接不是 Anyone with the link、"
+            "文件被删除，或 Drive 配额用尽）。"
+        )
+
     total = sum(sizes.values())
-    max_file = max(sizes.values()) if sizes else 0
+    max_file = max(sizes.values())
     free = shutil.disk_usage(src).free
     if free < max_file + PACK_SLACK_BYTES:
         raise RuntimeError(
@@ -428,9 +440,12 @@ def relay_gh(args: argparse.Namespace, plan: list[tuple[str, str]]) -> int:
             "gh 模式建议总量 ≤ 20 GiB、单个文件 ≤ 10 GiB；更大的数据请用 "
             "--storage hf，或把 Drive 文件夹拆成几个子文件夹分别搬运。"
         )
-    log(f"共 {len(plan)} 个文件，{human(total)}；最大单文件 {human(max_file)}")
+    log(
+        f"共 {len(sizes)}/{len(plan)} 个文件成功，{human(total)}；"
+        f"最大单文件 {human(max_file)}"
+    )
 
-    rels = [rel for _, rel in plan]
+    rels = list(sizes)
     log("计算 sha256 清单...")
     write_sha256sums(src, rels, Path("SHA256SUMS"))
 
@@ -513,6 +528,20 @@ def relay_gh(args: argparse.Namespace, plan: list[tuple[str, str]]) -> int:
         "本机下载："
         f"./pull-release.sh -r {repo} -t {args.tag} -o ~/data/{args.tag}"
     )
+    if failed:
+        log("")
+        log(
+            f"注意：{len(failed)} 个文件没有下载成功，Release 只包含其余 "
+            f"{len(sizes)} 个文件。",
+            err=True,
+        )
+        for rel, msg in failed:
+            log(f"  - {rel}: {msg}", err=True)
+        log(
+            "修好共享权限后，用同一个 tag 加 force=true 重跑即可补齐。",
+            err=True,
+        )
+        return 1
     return 0
 
 
@@ -589,6 +618,8 @@ def relay_hf(args: argparse.Namespace, plan: list[tuple[str, str]]) -> int:
             if not args.keep:
                 local.unlink(missing_ok=True)
         except Exception as exc:  # noqa: BLE001
+            if args.fail_fast:
+                raise
             print(f"    失败: {exc}", file=sys.stderr, flush=True)
             failed.append(f"{rel}: {exc}")
             time.sleep(3)
@@ -633,6 +664,11 @@ def main() -> int:
     ap.add_argument("--part-size", type=int, default=PART_SIZE_DEFAULT, help="[gh] 分片字节数")
     ap.add_argument("--timeout", type=float, default=60.0, help="网络超时秒数")
     ap.add_argument("--retries", type=int, default=3, help="gdown 每个文件的重试次数")
+    ap.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="任一文件失败就退出（默认跳过失败文件，其余照常打包上传）",
+    )
     ap.add_argument("--debug", action="store_true", help="出错时打印完整 traceback")
     args = ap.parse_args()
 
@@ -675,6 +711,13 @@ def main() -> int:
         elif "no space" in text or "disk" in text or "磁盘" in text or "broken pipe" in text:
             print(
                 "提示：runner 磁盘不足。把文件夹拆小，或改用 --storage hf。",
+                file=sys.stderr,
+            )
+        elif "owner and editors" in text:
+            print(
+                "提示：这个 Drive 文件没有公开下载权限，匿名中转下不了。"
+                "让所有者把该文件设为「Anyone with the link」并允许下载，"
+                "或只搬其余文件（默认会跳过失败文件）。",
                 file=sys.stderr,
             )
         elif "permission" in text or "403" in text or "not found" in text:
