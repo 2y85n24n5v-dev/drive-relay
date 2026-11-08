@@ -1,1 +1,133 @@
+name: drive-relay
+
+# 在 GitHub Actions 的境外 runner 上把 Google Drive 内容搬出来：
+#   gh 模式 -> 当前仓库的 Release（公开仓库，本机用 ghfast.top 取回）
+#   hf 模式 -> 你的 Hugging Face 私有仓库（本机用 hf-mirror.com 取回）
+#
+# 触发：Actions -> drive-relay -> Run workflow。
+# 不需要改 hosts，不需要 VPN，不需要自己的境外服务器。
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_url:
+        description: "Google Drive 文件夹或文件链接（Anyone with the link）"
+        required: true
+        type: string
+      storage:
+        description: "落地方式：gh = GitHub Release，hf = Hugging Face"
+        required: true
+        default: gh
+        type: choice
+        options:
+          - gh
+          - hf
+      repo:
+        description: "gh 留空 = 当前仓库；hf 填 用户名/仓库名"
+        required: false
+        default: ""
+        type: string
+      tag:
+        description: "gh 的 Release 标签（每个任务用一个新 tag）"
+        required: false
+        default: relay
+        type: string
+      dest:
+        description: "hf 的仓库内子目录（不同任务填不同名字）"
+        required: false
+        default: ""
+        type: string
+      force:
+        description: "覆盖同 tag 的旧产物（源文件改过时才需要）"
+        required: false
+        default: false
+        type: boolean
+      part_size:
+        description: "gh 分片字节数（留空 = 1.9 GiB；一般不用填）"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: drive-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # 低于 6 小时上限，留出收尾时间
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Free disk
+        run: |
+          set -euxo pipefail
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Relay
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DRIVE_URL: ${{ github.event.inputs.drive_url }}
+          STORAGE: ${{ github.event.inputs.storage }}
+          REPO: ${{ github.event.inputs.repo }}
+          TAG: ${{ github.event.inputs.tag }}
+          DEST: ${{ github.event.inputs.dest }}
+          FORCE: ${{ github.event.inputs.force }}
+          PART_SIZE: ${{ github.event.inputs.part_size }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          args=(--url "$DRIVE_URL" --storage "$STORAGE" --tag "$TAG")
+          if [ -n "$REPO" ]; then args+=(--repo "$REPO"); fi
+          if [ -n "$DEST" ]; then args+=(--dest "$DEST"); fi
+          if [ "$FORCE" = "true" ]; then args+=(--force); fi
+          if [ -n "$PART_SIZE" ]; then
+            if ! [[ "$PART_SIZE" =~ ^[0-9]+$ ]]; then
+              echo "part_size 必须是纯数字（字节数）" >&2
+              exit 2
+            fi
+            args+=(--part-size "$PART_SIZE")
+          fi
+          if [ "$STORAGE" = "hf" ] && [ -z "$REPO" ]; then
+            echo "hf 模式必须填 repo（用户名/仓库名）" >&2
+            exit 2
+          fi
+          if [ "$STORAGE" = "hf" ] && [ -z "${HF_TOKEN:-}" ]; then
+            echo "hf 模式需要仓库 secret HF_TOKEN" >&2
+            exit 2
+          fi
+          echo "python: $(python --version)"
+          echo "gh: $(gh --version | head -1)"
+          df -h /
+          python relay.py "${args[@]}"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          df -h /
+          echo "如果磁盘满：把 Drive 文件夹拆小，或改用 storage=hf。"
+          echo "如果 403：检查 Settings -> Actions -> General -> Workflow permissions。"
 
